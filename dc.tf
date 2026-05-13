@@ -1,117 +1,108 @@
 # ==================================================================================================
-# Fetch the Canonical-published Ubuntu 24.04 AMI ID from AWS Systems Manager Parameter Store
-# This path is maintained by Canonical; it always points at the current stable AMI for 24.04 (amd64, HVM, gp3)
+# Resolve Ubuntu 24.04 image from Oracle's image catalog
+# Filtered by shape + OS version, sorted newest-first for deterministic resolution
 # ==================================================================================================
-data "aws_ssm_parameter" "ubuntu_24_04" {
-  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+
+data "oci_identity_availability_domains" "ads" {
+  compartment_id = var.compartment_id
+}
+
+data "oci_core_images" "ubuntu" {
+  compartment_id           = var.compartment_id
+  operating_system         = "Canonical Ubuntu"
+  operating_system_version = "24.04"
+  shape                    = var.instance_shape
+  sort_by                  = "TIMECREATED"
+  sort_order               = "DESC"
 }
 
 # ==================================================================================================
-# Resolve the full AMI object using the ID returned by SSM
-# - Restrict owner to Canonical to avoid spoofed AMIs
-# - Filter by the exact image-id pulled above
-# - most_recent is kept true as a guard when multiple matches exist in a region
+# OCI Compute Instance: Ubuntu 24.04 for Samba-based mini-AD DC
+# - Private subnet only (assign_public_ip = false)
+# - NSG controls required AD/DC ports
+# - user_data must be base64-encoded for OCI cloud-init
 # ==================================================================================================
-data "aws_ami" "ubuntu_ami" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
 
-  filter {
-    name   = "image-id"
-    values = [data.aws_ssm_parameter.ubuntu_24_04.value]
+resource "oci_core_instance" "mini_ad_dc_instance" {
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  compartment_id      = var.compartment_id
+  shape               = var.instance_shape
+  display_name        = "mini-ad-dc-${lower(var.netbios)}"
+
+  shape_config {
+    ocpus         = var.instance_ocpus
+    memory_in_gbs = var.instance_memory_gb
+  }
+
+  source_details {
+    source_type = "image"
+    source_id   = data.oci_core_images.ubuntu.images[0].id
+  }
+
+  create_vnic_details {
+    subnet_id        = var.subnet_ocid
+    assign_public_ip = false
+    nsg_ids          = [oci_core_network_security_group.ad_nsg.id]
+  }
+
+  metadata = {
+    ssh_authorized_keys = var.ssh_public_key
+    user_data = base64encode(templatefile("${path.module}/scripts/mini-ad.sh.template", {
+      HOSTNAME_DC        = "ad1"
+      DNS_ZONE           = var.dns_zone
+      REALM              = var.realm
+      NETBIOS            = var.netbios
+      ADMINISTRATOR_PASS = var.ad_admin_password
+      ADMIN_USER_PASS    = var.ad_admin_password
+      USERS_JSON         = local.effective_users_json
+    }))
   }
 }
 
 # ==================================================================================================
-# EC2 instance: Ubuntu 24.04 for Samba-based mini-AD DC
-# - Private subnet only (no public IP)
-# - IAM instance profile enables SSM connectivity (Session Manager, etc.)
-# - User data renders from a template with domain settings and admin secrets
+# Update VCN default DHCP options to direct instances to this DC for DNS resolution
+# Conditional on dhcp_update; applied after a delay for DC provisioning to complete
 # ==================================================================================================
-resource "aws_instance" "mini_ad_dc_instance" {
-  ami                    = data.aws_ami.ubuntu_ami.id
-  instance_type          = var.instance_type             # Small, adequate for lab AD DC; scale up for real loads
-  subnet_id              = var.subnet_id                 # Place in private subnet
-  vpc_security_group_ids = [aws_security_group.ad_sg.id] # Open required AD/DC ports per your SG
 
-  associate_public_ip_address = false # Private-only; reach it via SSM/bastion/VPN
-
-  iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
-
-  user_data = templatefile("${path.module}/scripts/mini-ad.sh.template", {
-    HOSTNAME_DC        = "ad1"
-    DNS_ZONE           = var.dns_zone
-    REALM              = var.realm
-    NETBIOS            = var.netbios
-    ADMINISTRATOR_PASS = var.ad_admin_password
-    ADMIN_USER_PASS    = var.ad_admin_password
-    USERS_JSON         = local.effective_users_json
-  })
-
-  tags = {
-    Name = "mini-ad-dc-${lower(var.netbios)}"
-  }
-}
-
-# ==================================================================================================
-# DHCP options for the VPC to direct instances to this DC for DNS
-# - domain_name: sets the search suffix (your AD DNS zone)
-# - domain_name_servers: points DHCP clients at the DC’s private IP for lookups
-# ==================================================================================================
-resource "aws_vpc_dhcp_options" "mini_ad_dns" {
-  domain_name         = var.dns_zone
-  domain_name_servers = [aws_instance.mini_ad_dc_instance.private_ip]
-
-  tags = {
-    Name = "mini-ad-dns"
-  }
-}
-
-# ==================================================================================================
-# Delay to allow the DC to finish provisioning (Samba/DNS up) before associating DHCP options
-# Adjust duration to your bootstrap time; 180s is a conservative lab default
-# ==================================================================================================
 resource "time_sleep" "wait_for_mini_ad" {
-  depends_on      = [aws_instance.mini_ad_dc_instance]
+  depends_on      = [oci_core_instance.mini_ad_dc_instance]
   create_duration = "300s"
 }
 
-# ==================================================================================================
-# Associate the custom DHCP options with the VPC once the DC is up
-# This causes new DHCP leases to prefer the DC for DNS resolution within the VPC
-# ==================================================================================================
-resource "aws_vpc_dhcp_options_association" "mini_ad_dns_assoc" {
-  count           = var.dhcp_update ? 1 : 0
-  vpc_id          = var.vpc_id
-  dhcp_options_id = aws_vpc_dhcp_options.mini_ad_dns.id
-  depends_on      = [time_sleep.wait_for_mini_ad]
+resource "oci_core_default_dhcp_options" "mini_ad_dns" {
+  count = var.dhcp_update ? 1 : 0
+
+  # Modifies the VCN's existing default DHCP options in-place
+  manage_default_resource_id = var.vcn_default_dhcp_options_id
+
+  options {
+    type        = "DomainNameServer"
+    server_type = "CustomDnsServer"
+    custom_dns_servers = [oci_core_instance.mini_ad_dc_instance.private_ip]
+  }
+
+  options {
+    type                = "SearchDomain"
+    search_domain_names = [var.dns_zone]
+  }
+
+  depends_on = [time_sleep.wait_for_mini_ad]
 }
 
-# ==========================================================================================
-# Local Variable: default_users_json
-# ------------------------------------------------------------------------------------------
-# - Renders a JSON file (`users.json.template`) into a single JSON blob
-# - Injects unique random passwords for test/demo users
-# - Template variables are replaced with real values at runtime
-# - Passed into the VM bootstrap so users are created automatically
-# ==========================================================================================
+# ==================================================================================================
+# Render seed users/groups JSON for DC bootstrap
+# ==================================================================================================
 
 locals {
   default_users_json = templatefile("${path.module}/scripts/users.json.template", {
-    USER_BASE_DN      = var.user_base_dn      # Base DN for placing new users in LDAP
-    DNS_ZONE          = var.dns_zone          # AD-integrated DNS zone
-    REALM             = var.realm             # Kerberos realm (FQDN in uppercase)
-    NETBIOS           = var.netbios           # NetBIOS domain name
-    sysadmin_password = var.ad_admin_password # Sysadmin password
+    USER_BASE_DN      = var.user_base_dn
+    DNS_ZONE          = var.dns_zone
+    REALM             = var.realm
+    NETBIOS           = var.netbios
+    sysadmin_password = var.ad_admin_password
   })
 }
 
-# -------------------------------------------------------------------
-# Local variable: effective_users_json
-# - Determines which users.json definition to use
-# - If the caller provides var.users_json → use that
-# - Otherwise, fall back to local.default_users_json
-# -------------------------------------------------------------------
 locals {
   effective_users_json = coalesce(var.users_json, local.default_users_json)
 }

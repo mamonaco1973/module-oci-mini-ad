@@ -1,5 +1,4 @@
-
 output "dns_server" {
-  description = "DNS server IP address for the mini-ad deployment."
-  value       = aws_instance.mini_ad_dc_instance.private_ip
+  description = "Private IP address of the mini-AD DC, used as the DNS server for VCN clients."
+  value       = oci_core_instance.mini_ad_dc_instance.private_ip
 }

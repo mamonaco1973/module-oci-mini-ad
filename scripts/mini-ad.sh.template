@@ -10,18 +10,24 @@ trap 'echo "ERROR at line $LINENO"; exit 1' ERR
 
 echo "user-data start: $(date -Is)"
 
-# Insure network connectivity
-for i in {1..60}; do
-  echo "checking network"
-  if getent hosts awscli.amazonaws.com >/dev/null 2>&1 && \
-     curl -fsS --max-time 5 https://awscli.amazonaws.com/ >/dev/null 2>&1; then
-    echo "network ready after $((i*5))s"
-    break
-  fi
+# OCI fires cloud-init before DNS resolves — loop on nslookup before proceeding
+# Without this gate, apt-get will fail immediately on a fresh instance
+echo "Waiting for DNS resolution..."
+until nslookup us.archive.ubuntu.com >/dev/null 2>&1; do
+  echo "DNS not ready yet, retrying in 5s..."
   sleep 5
 done
+echo "DNS ready: $(date -Is)"
 
-# Terraform-injected inputs 
+# Confirm outbound internet connectivity before package install
+echo "Waiting for outbound internet connectivity..."
+until curl -fsS --max-time 10 https://us.archive.ubuntu.com/ >/dev/null 2>&1; do
+  echo "Internet not reachable yet, retrying in 5s..."
+  sleep 5
+done
+echo "Network ready: $(date -Is)"
+
+# Terraform-injected inputs
 HOSTNAME_DC="${HOSTNAME_DC}"
 DNS_ZONE="${DNS_ZONE}"
 REALM="${REALM}"
@@ -34,22 +40,16 @@ ${USERS_JSON}
 EOF
 chmod 600 /root/seed_users.json
 
-# SSM
-snap install amazon-ssm-agent --classic
-systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service
-
 # Packages
+# Rewrite apt sources — oracle.com mirrors avoid ubuntu.com DDoS issues
+sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+sed -i 's|http://security.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
   samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
   ldb-tools jq git python3-flask
-
-# AWS CLI
-curl -s https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
-unzip -q /tmp/aws.zip -d /tmp
-/tmp/aws/install --update
-rm -rf /tmp/aws /tmp/aws.zip
 
 # Preserve hostname + set hostname
 mkdir -p /etc/cloud/cloud.cfg.d
@@ -66,11 +66,11 @@ debconf-set-selections <<< "krb5-config krb5-config/default_realm string $REALM"
 debconf-set-selections <<< "krb5-config krb5-config/kerberos_servers string"
 debconf-set-selections <<< "krb5-config krb5-config/admin_server string"
 
-# Chrony (AWS time)
-if ! grep -q "169.254.169.123" /etc/chrony/chrony.conf; then
+# Chrony NTP — use public pool; OCI does not expose a link-local NTP endpoint
+if ! grep -q "ntp.ubuntu.com" /etc/chrony/chrony.conf; then
   sed -i 's/^pool .*//g' /etc/chrony/chrony.conf || true
   cat >> /etc/chrony/chrony.conf <<EOF
-server 169.254.169.123 prefer iburst
+pool ntp.ubuntu.com iburst
 makestep 1.0 3
 rtcsync
 EOF
@@ -94,8 +94,9 @@ if [ ! -f /var/lib/samba/private/sam.ldb ]; then
     --host-name="$HOSTNAME_DC" \
     --adminpass="$ADMINISTRATOR_PASS"
 
+  # Forward unknown DNS queries to Google public DNS
   sed -i '/^\s*dns forwarder\s*=/d' /etc/samba/smb.conf
-  sed -i '/^\[global\]/a dns forwarder = 169.254.169.253' /etc/samba/smb.conf
+  sed -i '/^\[global\]/a dns forwarder = 8.8.8.8' /etc/samba/smb.conf
 
   cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
   systemctl enable --now samba-ad-dc
@@ -109,11 +110,11 @@ systemctl disable systemd-resolved || true
 cat > /etc/resolv.conf <<EOF
 search $DNS_ZONE
 nameserver 127.0.0.1
-nameserver 169.254.169.253
+nameserver 8.8.8.8
 EOF
 chattr +i /etc/resolv.conf || true
 
-# Optional insecure LDAP simple binds
+# Allow insecure LDAP simple binds (lab only)
 sed -i '/^\s*ldap server require strong auth/d' /etc/samba/smb.conf
 sed -i '/^\[global\]/a ldap server require strong auth = no' /etc/samba/smb.conf
 systemctl restart samba-ad-dc || true
@@ -226,14 +227,14 @@ EOF
   done
 done
 
-# maxids service
+# maxids service — clone OCI module repo and install systemd unit
 cd /
 
-if [ ! -d "/module-aws-mini-ad" ]; then
-  git clone "https://github.com/mamonaco1973/module-aws-mini-ad.git"
+if [ ! -d "/module-oci-mini-ad" ]; then
+  git clone "https://github.com/mamonaco1973/module-oci-mini-ad.git"
 fi
 
-cd "/module-aws-mini-ad/scripts"
+cd "/module-oci-mini-ad/scripts"
 cp "maxids.service" "/etc/systemd/system/maxids.service"
 
 systemctl daemon-reload
