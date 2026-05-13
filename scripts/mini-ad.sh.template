@@ -1,0 +1,244 @@
+#!/bin/bash
+set -euo pipefail
+
+LOG=/root/userdata.log
+mkdir -p /root
+touch "$LOG"
+chmod 600 "$LOG"
+exec > >(tee -a "$LOG" | logger -t user-data -s 2>/dev/console) 2>&1
+trap 'echo "ERROR at line $LINENO"; exit 1' ERR
+
+echo "user-data start: $(date -Is)"
+
+# Insure network connectivity
+for i in {1..60}; do
+  echo "checking network"
+  if getent hosts awscli.amazonaws.com >/dev/null 2>&1 && \
+     curl -fsS --max-time 5 https://awscli.amazonaws.com/ >/dev/null 2>&1; then
+    echo "network ready after $((i*5))s"
+    break
+  fi
+  sleep 5
+done
+
+# Terraform-injected inputs 
+HOSTNAME_DC="${HOSTNAME_DC}"
+DNS_ZONE="${DNS_ZONE}"
+REALM="${REALM}"
+NETBIOS="${NETBIOS}"
+ADMINISTRATOR_PASS="${ADMINISTRATOR_PASS}"
+ADMIN_USER_PASS="${ADMIN_USER_PASS}"
+
+cat > /root/seed_users.json <<'EOF'
+${USERS_JSON}
+EOF
+chmod 600 /root/seed_users.json
+
+# SSM
+snap install amazon-ssm-agent --classic
+systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+# Packages
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y \
+  samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
+  ldb-tools jq git python3-flask
+
+# AWS CLI
+curl -s https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
+unzip -q /tmp/aws.zip -d /tmp
+/tmp/aws/install --update
+rm -rf /tmp/aws /tmp/aws.zip
+
+# Preserve hostname + set hostname
+mkdir -p /etc/cloud/cloud.cfg.d
+echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+hostnamectl set-hostname "$HOSTNAME_DC"
+
+# /etc/hosts
+IPV4="$(hostname -I | awk '{print $1}')"
+sed -i "/\b$HOSTNAME_DC\b/d" /etc/hosts || true
+echo "$IPV4 $HOSTNAME_DC.$DNS_ZONE $HOSTNAME_DC" >> /etc/hosts
+
+# Kerberos preseed
+debconf-set-selections <<< "krb5-config krb5-config/default_realm string $REALM"
+debconf-set-selections <<< "krb5-config krb5-config/kerberos_servers string"
+debconf-set-selections <<< "krb5-config krb5-config/admin_server string"
+
+# Chrony (AWS time)
+if ! grep -q "169.254.169.123" /etc/chrony/chrony.conf; then
+  sed -i 's/^pool .*//g' /etc/chrony/chrony.conf || true
+  cat >> /etc/chrony/chrony.conf <<EOF
+server 169.254.169.123 prefer iburst
+makestep 1.0 3
+rtcsync
+EOF
+fi
+systemctl enable --now chrony
+
+# Stop legacy services (DC uses samba-ad-dc)
+systemctl stop smbd nmbd winbind || true
+systemctl disable smbd nmbd winbind || true
+
+# Provision DC once
+if [ ! -f /var/lib/samba/private/sam.ldb ]; then
+  mv /etc/samba/smb.conf /etc/samba/smb.conf.bak 2>/dev/null || true
+
+  samba-tool domain provision \
+    --use-rfc2307 \
+    --realm="$REALM" \
+    --domain="$NETBIOS" \
+    --server-role=dc \
+    --dns-backend=SAMBA_INTERNAL \
+    --host-name="$HOSTNAME_DC" \
+    --adminpass="$ADMINISTRATOR_PASS"
+
+  sed -i '/^\s*dns forwarder\s*=/d' /etc/samba/smb.conf
+  sed -i '/^\[global\]/a dns forwarder = 169.254.169.253' /etc/samba/smb.conf
+
+  cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+  systemctl enable --now samba-ad-dc
+fi
+
+# Disable systemd-resolved + pin resolv.conf
+systemctl stop systemd-resolved || true
+systemctl disable systemd-resolved || true
+[ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+
+cat > /etc/resolv.conf <<EOF
+search $DNS_ZONE
+nameserver 127.0.0.1
+nameserver 169.254.169.253
+EOF
+chattr +i /etc/resolv.conf || true
+
+# Optional insecure LDAP simple binds
+sed -i '/^\s*ldap server require strong auth/d' /etc/samba/smb.conf
+sed -i '/^\[global\]/a ldap server require strong auth = no' /etc/samba/smb.conf
+systemctl restart samba-ad-dc || true
+
+sleep 30
+
+# Kerberos sanity (best-effort)
+kinit "Administrator@$REALM" <<< "$ADMINISTRATOR_PASS" || true
+klist || true
+kdestroy || true
+
+# Day-to-day Admin user
+if ! samba-tool user show Admin >/dev/null 2>&1; then
+  samba-tool user create Admin "$ADMIN_USER_PASS"
+  samba-tool group addmembers "Domain Admins" Admin
+  samba-tool user setexpiry Admin --noexpiry
+  samba-tool user setexpiry Administrator --noexpiry
+fi
+
+# Write secrets file
+SECRETS_FILE=/root/ad-secrets.txt
+: > "$SECRETS_FILE"
+chmod 600 "$SECRETS_FILE"
+{
+  echo "Mini-AD provisioned: $(date -Is)"
+  echo "Realm: $REALM"
+  echo "DNS: $DNS_ZONE"
+  echo "NetBIOS: $NETBIOS"
+  echo "Hostname: $HOSTNAME_DC"
+  echo "IP: $IPV4"
+  echo "Administrator: $ADMINISTRATOR_PASS"
+  echo "Admin: $ADMIN_USER_PASS"
+} >> "$SECRETS_FILE"
+
+# Seed users/groups
+SEED_FILE=/root/seed_users.json
+DNS_ZONE="$(jq -r '.domain.dnsZone' "$SEED_FILE")"
+NETBIOS="$(jq -r '.domain.netbios' "$SEED_FILE")"
+USER_BASE_DN="$(jq -r '.domain.userBaseDn // empty' "$SEED_FILE")"
+
+if [ -z "$USER_BASE_DN" ]; then
+  DOMAIN_DN="$(echo "$DNS_ZONE" | awk -F. '{for(i=1;i<=NF;i++)printf "DC=%s%s",$i,(i<NF?",":"")}')"
+  USER_BASE_DN="CN=Users,$DOMAIN_DN"
+fi
+
+jq -c '.groups[]' "$SEED_FILE" | while read -r group; do
+  NAME="$(echo "$group" | jq -r .name)"
+  GID="$(echo "$group" | jq -r .gidNumber)"
+  if ! samba-tool group show "$NAME" >/dev/null 2>&1; then
+    echo "group: $NAME (gid=$GID)"
+    samba-tool group add "$NAME" \
+      --nis-domain="$NETBIOS" \
+      --gid-number="$GID" \
+      --description="Sample Group - $NAME" >> /root/ad_group_attributes.log 2>&1
+  fi
+done
+
+jq -c '.users[]' "$SEED_FILE" | while read -r user; do
+  USERNAME="$(echo "$user" | jq -r .username)"
+  GIVENNAME="$(echo "$user" | jq -r .givenName)"
+  SURNAME="$(echo "$user" | jq -r .surname)"
+  PASSWORD="$(echo "$user" | jq -r .password)"
+  UID_NUMBER="$(echo "$user" | jq -r .uidNumber)"
+  GID_NUMBER="$(echo "$user" | jq -r .gidNumber)"
+  PRIMARY_GROUP="$(echo "$user" | jq -r .primaryGroup)"
+
+  DISPLAYNAME="$GIVENNAME $SURNAME"
+  EMAIL="$USERNAME@$DNS_ZONE"
+
+  if ! samba-tool user show "$USERNAME" >/dev/null 2>&1; then
+    echo "user: $USERNAME"
+    samba-tool user create "$USERNAME" "$PASSWORD" \
+      --given-name="$GIVENNAME" \
+      --surname="$SURNAME" \
+      --mail-address="$EMAIL" \
+      --description="Sample User - $DISPLAYNAME" >> /root/ad_user_attributes.log 2>&1
+
+    samba-tool user setexpiry "$USERNAME" --noexpiry >> /root/ad_user_attributes.log 2>&1
+    samba-tool group addmembers "$PRIMARY_GROUP" "$USERNAME" >> /root/ad_user_attributes.log 2>&1
+
+    ldbmodify -H /var/lib/samba/private/sam.ldb <<EOF
+dn: CN=$DISPLAYNAME,$USER_BASE_DN
+changetype: modify
+add: objectClass
+objectClass: posixAccount
+-
+replace: uid
+uid: $USERNAME
+-
+replace: uidNumber
+uidNumber: $UID_NUMBER
+-
+replace: gidNumber
+gidNumber: $GID_NUMBER
+-
+replace: loginShell
+loginShell: /bin/bash
+-
+replace: unixHomeDirectory
+unixHomeDirectory: /home/$USERNAME
+-
+replace: msSFU30NisDomain
+msSFU30NisDomain: $NETBIOS
+EOF
+  fi
+
+  echo "$user" | jq -r '.extraGroups[]?' | while IFS= read -r grp; do
+    echo "member: $USERNAME -> $grp" >> /root/ad_user_attributes.log 2>&1
+    samba-tool group addmembers "$grp" "$USERNAME" >> /root/ad_user_attributes.log 2>&1
+  done
+done
+
+# maxids service
+cd /
+
+if [ ! -d "/module-aws-mini-ad" ]; then
+  git clone "https://github.com/mamonaco1973/module-aws-mini-ad.git"
+fi
+
+cd "/module-aws-mini-ad/scripts"
+cp "maxids.service" "/etc/systemd/system/maxids.service"
+
+systemctl daemon-reload
+systemctl enable "maxids"
+systemctl start "maxids"
+
+echo "user-data complete: $(date -Is)"
+reboot
