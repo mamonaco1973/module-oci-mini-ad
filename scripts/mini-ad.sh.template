@@ -14,16 +14,16 @@ echo "user-data start: $(date -Is)"
 # Without this gate, apt-get will fail immediately on a fresh instance
 echo "Waiting for DNS resolution..."
 until nslookup us.archive.ubuntu.com >/dev/null 2>&1; do
-  echo "DNS not ready yet, retrying in 5s..."
-  sleep 5
+  echo "DNS not ready yet, retrying in 30s..."
+  sleep 30
 done
 echo "DNS ready: $(date -Is)"
 
 # Confirm outbound internet connectivity before package install
 echo "Waiting for outbound internet connectivity..."
 until curl -fsS --max-time 10 https://us.archive.ubuntu.com/ >/dev/null 2>&1; do
-  echo "Internet not reachable yet, retrying in 5s..."
-  sleep 5
+  echo "Internet not reachable yet, retrying in 30s..."
+  sleep 30
 done
 echo "Network ready: $(date -Is)"
 

@@ -66,7 +66,7 @@ resource "oci_core_instance" "mini_ad_dc_instance" {
 
 resource "time_sleep" "wait_for_mini_ad" {
   depends_on      = [oci_core_instance.mini_ad_dc_instance]
-  create_duration = "300s"
+  create_duration = "600s"
 }
 
 resource "oci_core_default_dhcp_options" "mini_ad_dns" {
