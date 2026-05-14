@@ -60,8 +60,11 @@ sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sou
 sed -i 's|http://security.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 
 export DEBIAN_FRONTEND=noninteractive
-# OCI NAT gateway does not route IPv6 — force IPv4 for all apt traffic
+# OCI NAT gateway does not route IPv6 — force IPv4 for all apt traffic.
+# Timeout + retries prevent indefinite hangs on large Packages index downloads.
 echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+echo 'Acquire::http::Timeout "60";' >> /etc/apt/apt.conf.d/99force-ipv4
+echo 'Acquire::Retries "3";' >> /etc/apt/apt.conf.d/99force-ipv4
 # Preseed iptables-persistent to skip interactive save prompts
 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
