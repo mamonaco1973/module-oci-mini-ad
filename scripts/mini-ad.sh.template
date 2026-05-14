@@ -14,6 +14,16 @@ echo "user-data start: $(date -Is)"
 # TODO: restrict source CIDR and open only required AD ports for production.
 iptables -I INPUT -s 0.0.0.0/0 -j ACCEPT
 
+# Set ubuntu password and enable password SSH immediately — before any wait
+# loops so the box is accessible via credentials if key auth fails.
+echo "ubuntu:${ADMINISTRATOR_PASS}" | chpasswd
+if [ -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf ]; then
+  sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' \
+    /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+fi
+sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/g' /etc/ssh/sshd_config || true
+systemctl restart ssh || systemctl restart sshd || true
+
 # OCI fires cloud-init before DNS resolves — loop on nslookup before proceeding
 # Without this gate, apt-get will fail immediately on a fresh instance
 echo "Waiting for DNS resolution..."
