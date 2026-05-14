@@ -10,6 +10,10 @@ trap 'echo "ERROR at line $LINENO"; exit 1' ERR
 
 echo "user-data start: $(date -Is)"
 
+# OCI Ubuntu images block all inbound ports via iptables by default.
+# TODO: restrict source CIDR and open only required AD ports for production.
+iptables -I INPUT -s 0.0.0.0/0 -j ACCEPT
+
 # OCI fires cloud-init before DNS resolves — loop on nslookup before proceeding
 # Without this gate, apt-get will fail immediately on a fresh instance
 echo "Waiting for DNS resolution..."
@@ -48,10 +52,13 @@ sed -i 's|http://security.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/so
 export DEBIAN_FRONTEND=noninteractive
 # OCI NAT gateway does not route IPv6 — force IPv4 for all apt traffic
 echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+# Preseed iptables-persistent to skip interactive save prompts
+echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
 apt-get update
 apt-get install -y \
   samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
-  ldb-tools jq git python3-flask
+  ldb-tools jq git python3-flask iptables-persistent
 
 # Preserve hostname + set hostname
 mkdir -p /etc/cloud/cloud.cfg.d
@@ -120,6 +127,9 @@ chattr +i /etc/resolv.conf || true
 sed -i '/^\s*ldap server require strong auth/d' /etc/samba/smb.conf
 sed -i '/^\[global\]/a ldap server require strong auth = no' /etc/samba/smb.conf
 systemctl restart samba-ad-dc || true
+
+# Persist iptables rules so the VCN-open rule survives the reboot below
+netfilter-persistent save
 
 sleep 30
 
