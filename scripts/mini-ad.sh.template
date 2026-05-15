@@ -89,7 +89,7 @@ for i in {1..20}; do
 done
 apt-get install -y \
   samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
-  ldb-tools jq git python3-flask iptables-persistent
+  ldb-tools jq git python3-flask python3-venv iptables-persistent
 
 # Preserve hostname + set hostname
 mkdir -p /etc/cloud/cloud.cfg.d
