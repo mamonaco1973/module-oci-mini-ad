@@ -39,8 +39,9 @@ systemctl restart ssh || systemctl restart sshd || true
 
 # OCI fires cloud-init before DNS resolves — loop on nslookup before proceeding
 # Without this gate, apt-get will fail immediately on a fresh instance
+# DC is ARM64 (A1.Flex) — apt sources use ports.ubuntu.com, not archive.ubuntu.com
 echo "Waiting for DNS resolution..."
-until nslookup us.archive.ubuntu.com >/dev/null 2>&1; do
+until nslookup ports.ubuntu.com >/dev/null 2>&1; do
   echo "DNS not ready yet, retrying in 30s..."
   sleep 30
 done
@@ -48,7 +49,7 @@ echo "DNS ready: $(date -Is)"
 
 # Confirm outbound internet connectivity before package install
 echo "Waiting for outbound internet connectivity..."
-until curl -fsS --max-time 10 https://us.archive.ubuntu.com/ >/dev/null 2>&1; do
+until curl -fsS --max-time 10 http://ports.ubuntu.com/ >/dev/null 2>&1; do
   echo "Internet not reachable yet, retrying in 30s..."
   sleep 30
 done
@@ -67,11 +68,6 @@ ${USERS_JSON}
 EOF
 chmod 600 /root/seed_users.json
 
-# Packages
-# Rewrite apt sources — oracle.com mirrors avoid ubuntu.com DDoS issues
-sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-sed -i 's|http://security.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-
 export DEBIAN_FRONTEND=noninteractive
 # OCI NAT gateway does not route IPv6 — force IPv4 for all apt traffic.
 # Timeout + retries prevent indefinite hangs on large Packages index downloads.
@@ -81,11 +77,13 @@ echo 'Acquire::Retries "3";' >> /etc/apt/apt.conf.d/99force-ipv4
 # Preseed iptables-persistent to skip interactive save prompts
 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+# APT::Update::Error-Mode=any makes apt-get update exit non-zero when any
+# source fails — without it, W: warnings still exit 0 and fool the retry loop.
 for i in {1..20}; do
-  apt-get update -y && break
-  echo "apt-get update failed (attempt $i/20), killing apt and retrying in 15s..."
+  apt-get update -y -o APT::Update::Error-Mode=any && break
+  echo "apt-get update failed (attempt $i/20), killing apt and retrying in 30s..."
   pkill -9 -f apt 2>/dev/null || true
-  sleep 15
+  sleep 30
 done
 apt-get install -y \
   samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
