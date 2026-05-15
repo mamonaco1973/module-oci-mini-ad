@@ -7,6 +7,11 @@ variable "compartment_id" {
   type        = string
 }
 
+variable "tenancy_ocid" {
+  description = "OCID of the root tenancy — required for dynamic group creation."
+  type        = string
+}
+
 variable "dns_zone" {
   description = "DNS zone for the Samba AD domain (e.g., mcloud.mikecloud.com)."
   type        = string

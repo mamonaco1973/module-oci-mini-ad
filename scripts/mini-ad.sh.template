@@ -270,6 +270,12 @@ EOF
   done
 done
 
+# OCI CLI needed for instance principal auth to write the sentinel to Object Storage.
+# Installed in venv to avoid Debian urllib3 conflict with system Python packages.
+python3 -m venv /opt/oci-venv
+/opt/oci-venv/bin/pip install --quiet oci-cli
+ln -sf /opt/oci-venv/bin/oci /usr/local/bin/oci
+
 # maxids service — clone OCI module repo and install systemd unit
 cd /
 
@@ -285,4 +291,20 @@ systemctl enable "maxids"
 systemctl start "maxids"
 
 echo "user-data complete: $(date -Is)"
+
+# IAM policy propagation can lag behind Terraform resource creation —
+# retry until the instance principal permission takes effect.
+BUCKET_NAME="${BUCKET_NAME}"
+NAMESPACE="${NAMESPACE}"
+for i in $(seq 1 20); do
+  oci --auth instance_principal os object put \
+    --namespace-name "$NAMESPACE" \
+    --bucket-name "$BUCKET_NAME" \
+    --name "dc-ready" \
+    --file /dev/null \
+    --force && break
+  echo "Sentinel write attempt $i failed (IAM propagation lag), retrying in 30s..."
+  sleep 30
+done
+
 reboot

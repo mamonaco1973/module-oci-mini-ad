@@ -55,18 +55,47 @@ resource "oci_core_instance" "mini_ad_dc_instance" {
       ADMINISTRATOR_PASS = var.ad_admin_password
       ADMIN_USER_PASS    = var.ad_admin_password
       USERS_JSON         = local.effective_users_json
+      BUCKET_NAME        = local.sentinel_bucket_name
+      NAMESPACE          = data.oci_objectstorage_namespace.ns.namespace
     }))
   }
 }
 
 # ==================================================================================================
 # Update VCN default DHCP options to direct instances to this DC for DNS resolution
-# Conditional on dhcp_update; applied after a delay for DC provisioning to complete
+# Conditional on dhcp_update; applied only after sentinel confirms DC bootstrap is complete
 # ==================================================================================================
 
-resource "time_sleep" "wait_for_mini_ad" {
-  depends_on      = [oci_core_instance.mini_ad_dc_instance]
-  create_duration = "600s"
+resource "null_resource" "wait_for_mini_ad" {
+  depends_on = [
+    oci_core_instance.mini_ad_dc_instance,
+    oci_objectstorage_bucket.mini_ad_dc_sentinel,
+    oci_identity_policy.mini_ad_dc_sentinel_write,
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    command     = <<-EOT
+      TIMEOUT=900
+      START=$(date +%s)
+      echo "Waiting for mini-AD DC sentinel in bucket ${local.sentinel_bucket_name}..."
+      until oci os object get \
+        --namespace-name "${data.oci_objectstorage_namespace.ns.namespace}" \
+        --bucket-name "${local.sentinel_bucket_name}" \
+        --name "dc-ready" \
+        --file /dev/null 2>/dev/null; do
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - START))
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "Timeout: DC sentinel not found after $${TIMEOUT}s" >&2
+          exit 1
+        fi
+        echo "DC not ready ($${ELAPSED}s elapsed), retrying in 30s..."
+        sleep 30
+      done
+      echo "DC sentinel found — bootstrap complete."
+    EOT
+  }
 }
 
 resource "oci_core_default_dhcp_options" "mini_ad_dns" {
@@ -86,7 +115,7 @@ resource "oci_core_default_dhcp_options" "mini_ad_dns" {
     search_domain_names = [var.dns_zone]
   }
 
-  depends_on = [time_sleep.wait_for_mini_ad]
+  depends_on = [null_resource.wait_for_mini_ad]
 }
 
 # ==================================================================================================
