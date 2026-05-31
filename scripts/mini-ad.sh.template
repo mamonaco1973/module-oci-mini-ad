@@ -85,9 +85,13 @@ for i in {1..20}; do
   pkill -9 -f apt 2>/dev/null || true
   sleep 30
 done
-apt-get install -y \
-  samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
-  ldb-tools jq git python3-flask python3-venv iptables-persistent
+for i in {1..20}; do
+  apt-get install -y \
+    samba krb5-user winbind smbclient dnsutils acl attr chrony unzip \
+    ldb-tools jq git python3-flask python3-venv iptables-persistent && break
+  echo "apt-get install failed (attempt $i/20), retrying in 30s..."
+  sleep 30
+done
 
 # Preserve hostname + set hostname
 mkdir -p /etc/cloud/cloud.cfg.d
